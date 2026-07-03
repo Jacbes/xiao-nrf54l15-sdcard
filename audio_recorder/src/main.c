@@ -60,12 +60,11 @@
 #define CHUNK_MS         (CHUNK_SECONDS * 1000)
 #define BTN_DEBOUNCE_MS  300
 
-/* Battery ADC: nRF54L15 has internal VBAT measurement (no external pin).
- * VBAT channel measures VDD supply voltage directly.
+/* Battery ADC: AIN7 (P1.11 = A1 pin on XIAO).
+ * Wiki says AIN7_VBAT is connected via voltage divider.
  * With gain=1/4, ref=0.6V internal, 12-bit:
- *   range = 0.6V * 4 = 2.4V, 1 LSB = 2400/4096 ≈ 0.586 mV
- * VBAT measures VDD which is the battery through the regulator. */
-#define VBATT_ADC_CHANNEL    7   /* use SAADC channel 7 (physical) */
+ *   range = 0.6V * 4 = 2.4V, 1 LSB ≈ 0.586 mV */
+#define VBATT_ADC_CHANNEL    7
 #define VBATT_ADC_RESOLUTION 12
 
 static int read_battery_mv(void)
@@ -81,7 +80,7 @@ static int read_battery_mv(void)
 		.acquisition_time = ADC_ACQ_TIME_DEFAULT,
 		.channel_id = VBATT_ADC_CHANNEL,
 #if defined(CONFIG_ADC_NRFX_SAADC)
-		.input_positive = NRF_SAADC_VBAT,
+		.input_positive = 7, /* AIN7 */
 #endif
 	};
 
@@ -103,10 +102,9 @@ static int read_battery_mv(void)
 		return -3;
 	}
 
-	/* Convert raw to millivolts.
-	 * gain=1/4, ref=0.6V internal, 12-bit:
-	 *   1 LSB = (0.6 / 0.25) / 4096 = 2.4 / 4096 V ≈ 0.586 mV
-	 * VBAT channel measures VDD directly (after regulator from battery). */
+	/* Convert raw to millivolts at ADC pin.
+	 * gain=1/4, ref=0.6V, 12-bit: 1 LSB = 2400/4096 mV.
+	 * Board voltage divider ratio unknown — report raw ADC mV. */
 	int32_t mv = ((int32_t)sample_buf * 2400) / 4096;
 
 	return (int)mv;
