@@ -1,0 +1,13 @@
+# Zephyr / west build output
+build/
+*.o
+*.obj
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors / OS
+.vscode/
+.DS_Store
+Thumbs.db

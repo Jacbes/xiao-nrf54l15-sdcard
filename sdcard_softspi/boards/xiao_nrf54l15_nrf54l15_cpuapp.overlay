@@ -1,0 +1,57 @@
+/*
+ * SD card over SPI for Seeed XIAO nRF54L15 (Sense).
+ *
+ * User wiring:
+ *   SCK  = P2.01  (XIAO D8)
+ *   MOSI = P2.02  (XIAO D10)
+ *   MISO = P2.04  (XIAO D9)
+ *   CS   = P1.04  (XIAO D0)
+ *
+ * Why software (bit-bang) SPI instead of hardware SPIM:
+ *   - SPIM00 (the board's default xiao_spi on exactly these P2 pins) has a
+ *     hardware minimum clock of 2 MHz and therefore cannot produce the
+ *     <=400 kHz clock an SD card needs during its init handshake.
+ *   - SPIM20 shares the "serial 20" instance with UART20, which is the
+ *     board's console -> on-board USB-serial (COM port). Using SPIM20 would
+ *     kill the console.
+ *   Bit-bang toggles plain GPIOs, so it works at 400 kHz for init, needs no
+ *   serial peripheral instance, and leaves UART20/console intact.
+ */
+
+/ {
+	sdspi: sdspi {
+		compatible = "zephyr,spi-bitbang";
+		status = "okay";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		clk-gpios  = <&gpio2 1 GPIO_ACTIVE_HIGH>;   /* P2.01 SCK  */
+		mosi-gpios = <&gpio2 2 GPIO_ACTIVE_HIGH>;   /* P2.02 MOSI */
+		miso-gpios = <&gpio2 4 GPIO_ACTIVE_HIGH>;   /* P2.04 MISO */
+		cs-gpios   = <&gpio1 4 GPIO_ACTIVE_LOW>;    /* P1.04 CS   */
+
+		sdhc0: sdhc@0 {
+			compatible = "zephyr,sdhc-spi-slot";
+			reg = <0>;
+			status = "okay";
+			spi-max-frequency = <8000000>;
+
+			mmc {
+				compatible = "zephyr,sdmmc-disk";
+				disk-name = "SD";
+				status = "okay";
+			};
+		};
+	};
+
+	aliases {
+		sdhc0 = &sdhc0;
+	};
+};
+
+/* Free the P2.01/P2.02/P2.04 pins from the default hardware SPI (SPIM00)
+ * so the bit-bang driver can drive them as GPIOs.
+ */
+&xiao_spi {
+	status = "disabled";
+};
