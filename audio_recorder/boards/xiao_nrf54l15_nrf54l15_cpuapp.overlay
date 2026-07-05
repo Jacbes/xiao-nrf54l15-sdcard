@@ -69,13 +69,21 @@
 	};
 };
 
-/* PDM microphone on P1.12 (CLK) / P1.13 (DIN) - default board pins. */
+/* Enable the hardware watchdog (WDT31) so a hung thread reboots the SoC. */
+&wdt31 {
+	status = "okay";
+};
+
+/* PDM microphone on P1.12 (CLK) / P1.13 (DIN) - default board pins.
+ * queue-size kept small (6): our own 64 KiB ring buffer absorbs SD
+ * latency, and a small driver queue avoids mem-slab exhaustion that would
+ * otherwise stop the PDM peripheral. */
 &pdm20 {
 	status = "okay";
 	pinctrl-0 = <&pdm20_default>;
 	pinctrl-names = "default";
 	clock-source = "PCLK32M";
-	queue-size = <14>;
+	queue-size = <6>;
 };
 
 / {
