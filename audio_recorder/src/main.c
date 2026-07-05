@@ -20,6 +20,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/adc.h>
 #include <zephyr/drivers/watchdog.h>
 #include <zephyr/drivers/hwinfo.h>
 #include <zephyr/audio/dmic.h>
@@ -98,6 +99,38 @@ static struct k_thread dmic_th;
 K_THREAD_STACK_DEFINE(sd_stk, 12288);
 static struct k_thread sd_th;
 K_SEM_DEFINE(data_sem, 0, 1);
+
+/* Battery monitoring via ADC (channel 7, on-board divider). */
+#define VBATT_ADC_CH     7
+static bool adc_ch_ready;
+
+static int read_battery_mv(void)
+{
+	const struct device *d = DEVICE_DT_GET(DT_NODELABEL(adc));
+	if (!device_is_ready(d)) return -1;
+	if (!adc_ch_ready) {
+		struct adc_channel_cfg cc = {
+			.gain = ADC_GAIN_1_4,
+			.reference = ADC_REF_INTERNAL,
+			.acquisition_time = ADC_ACQ_TIME_DEFAULT,
+			.channel_id = VBATT_ADC_CH,
+#if defined(CONFIG_ADC_NRFX_SAADC)
+			.input_positive = 7,
+#endif
+		};
+		if (adc_channel_setup(d, &cc) != 0) return -1;
+		adc_ch_ready = true;
+	}
+	int16_t sb = 0;
+	struct adc_sequence as = {
+		.channels = BIT(VBATT_ADC_CH),
+		.buffer = &sb,
+		.buffer_size = sizeof(sb),
+		.resolution = 12,
+	};
+	if (adc_read(d, &as)) return -1;
+	return (int)(((int32_t)sb * 2400) / 4096);
+}
 
 /* Watchdog */
 static const struct device *wdt_dev;
@@ -487,13 +520,14 @@ static void sd_fn(void *a, void *b, void *c)
 			/* Heartbeat every 5 s. */
 			if (recording && now - last_hb >= 5000) {
 				int32_t el = (int32_t)((now - rec_start) / 1000);
+				int vb = read_battery_mv();
 				printk("  %02d:%02d  %uKB  drop %uKB  errs %u  "
-				       "ring %u\n",
+				       "ring %u  vbat %dmV\n",
 				       (int)(el / 60), (int)(el % 60),
 				       (unsigned)(written / 1024),
 				       (unsigned)(dropped / 1024),
 				       (unsigned)rec_errs,
-				       ring_buf_size_get(&audio_ring_buf));
+				       ring_buf_size_get(&audio_ring_buf), vb);
 				last_hb = now;
 			}
 		}
@@ -615,6 +649,8 @@ int main(void)
 		k_sleep(K_SECONDS(2));
 	}
 	printk("SD mounted\n");
+	int vbat = read_battery_mv();
+	printk("VBat: %d mV\n", vbat);
 	printk("Ready. Press button to record. Sleep after %d s idle.\n",
 	       (int)(IDLE_SLEEP_MS / 1000));
 
