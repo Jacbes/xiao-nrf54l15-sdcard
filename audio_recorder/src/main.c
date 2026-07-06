@@ -10,7 +10,7 @@
  *   Boot       -> LED solid ON, idle, waiting for button.
  *   Button #1  -> start recording, LED blinks.
  *   Button #2  -> stop recording, LED solid ON, idle.
- *   2 min idle -> system OFF (ultra-low-power), wake on button press.
+ *   10 s idle  -> system OFF (~1 µA), wake on button press.
  *
  * Fault tolerance:
  *   Three threads (dmic / sd / led). SD write errors trigger recovery
@@ -26,11 +26,15 @@
 #include <zephyr/audio/dmic.h>
 #include <zephyr/storage/disk_access.h>
 #include <zephyr/fs/fs.h>
+#include <zephyr/pm/device.h>
 #include <zephyr/sys/poweroff.h>
-#include <hal/nrf_gpio.h>
+#include <zephyr/sys/util.h>
 #include <ff.h>
 #include <string.h>
 #include <stdio.h>
+#if defined(CONFIG_RAM_POWER_DOWN_LIBRARY)
+#include <ram_pwrdn.h>
+#endif
 
 /* =============================  Constants  ============================== */
 
@@ -55,8 +59,10 @@ K_MEM_SLAB_DEFINE_STATIC(mem_slab, BLOCK_SIZE, BLOCK_COUNT, 4);
 #define RING_BUF_SIZE    65536
 RING_BUF_DECLARE(audio_ring_buf, RING_BUF_SIZE);
 
-/* Write buffer: flush 1 s of audio per fs_write. */
-#define WRITE_BUF_SIZE   AUDIO_BPS
+/* Write buffer: flush 0.5 s of audio per fs_write (16 KiB).
+ * Large enough for efficient SD block writes, but half the size of a
+ * 1 s buffer -- frees ~16 KiB of RAM (drops RAM use from ~82% to ~73%). */
+#define WRITE_BUF_SIZE   (AUDIO_BPS / 2)
 
 /* Timing */
 #define SYNC_MS          8000    /* FAT commit interval */
@@ -83,6 +89,7 @@ static const struct device *dmic_dev;
 
 static volatile bool btn_pressed;
 static volatile bool recording;
+static volatile bool going_to_sleep;
 static bool file_open;
 static bool sd_mounted;
 
@@ -284,12 +291,15 @@ static void dmic_disarm(void)
 
 /* =============================  Threads  ================================ */
 
-/* LED: solid ON when idle, fast blink when recording. */
+/* LED: solid ON when idle, fast blink when recording, OFF when sleeping. */
 static void led_fn(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
 	while (1) {
-		if (recording) {
+		if (going_to_sleep) {
+			gpio_pin_set_dt(&led, 0);
+			k_msleep(100);
+		} else if (recording) {
 			gpio_pin_set_dt(&led, 1);
 			k_msleep(150);
 			gpio_pin_set_dt(&led, 0);
@@ -598,12 +608,114 @@ static void stop_rec(void)
 	last_activity = k_uptime_get();
 }
 
+/* Deassert the on-board regulator-enable GPIOs so the PDM mic, the VBat
+ * divider and the RF front-end switch stop drawing current while we are
+ * in System OFF. On the XIAO nRF54L15 these are `regulator-boot-on`, so
+ * without this they stay latched active through sleep and dominate the
+ * sleep current. GPIO_OUTPUT_INACTIVE deasserts each one respecting its
+ * active-high/active-low polarity. */
+static void cut_board_power(void)
+{
+	static const struct gpio_dt_spec pwr[] = {
+		GPIO_DT_SPEC_GET(DT_NODELABEL(pdm_imu_pwr), enable_gpios),
+		GPIO_DT_SPEC_GET(DT_NODELABEL(vbat_pwr),    enable_gpios),
+		GPIO_DT_SPEC_GET(DT_NODELABEL(rfsw_pwr),    enable_gpios),
+		GPIO_DT_SPEC_GET(DT_NODELABEL(rfsw_ctl),    enable_gpios),
+	};
+
+	for (int i = 0; i < ARRAY_SIZE(pwr); i++) {
+		if (!device_is_ready(pwr[i].port)) {
+			continue;
+		}
+		gpio_pin_configure_dt(&pwr[i], GPIO_OUTPUT_INACTIVE);
+	}
+}
+
+/* =============================  Sleep  ================================== */
+
+static void enter_system_off(void)
+{
+	int rc;
+
+	printk("Entering system OFF\n");
+	going_to_sleep = true;
+
+	/* Make sure capture is stopped so the PDM peripheral is idle. */
+	if (recording) {
+		recording = false;
+		k_msleep(200);
+	}
+	dmic_disarm();
+
+	/* Unmount + deinit the SD stack so SPIM/EasyDMA releases its domain. */
+	sd_teardown();
+
+	/* LED off (explicit; the led thread already dims it on going_to_sleep). */
+	gpio_pin_configure_dt(&led, GPIO_OUTPUT_INACTIVE);
+
+	/* Cut power to the on-board mic / VBat divider / RF switch. */
+	cut_board_power();
+
+	/* Disable watchdog before sleep to prevent spurious reset. */
+	if (wdt_chan >= 0) {
+		wdt_disable(wdt_dev);
+	}
+
+	k_msleep(200);  /* let pending ISR / printk drain */
+
+	/* Suspend the UART console so the UARTE peripheral powers down. This
+	 * must succeed, otherwise the UART keeps the HF clock domain alive and
+	 * System OFF current stays high. Guarded by CONFIG_UART_CONSOLE: the
+	 * battery build has no UART device at all (RTT-only) and referencing
+	 * the (absent) console node would fail at link time. */
+#if defined(CONFIG_UART_CONSOLE)
+	const struct device *cons = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+	if (device_is_ready(cons)) {
+		rc = pm_device_action_run(cons, PM_DEVICE_ACTION_SUSPEND);
+		if (rc < 0) {
+			printk("Could not suspend console (%d)\n", rc);
+			return;
+		}
+	}
+#endif
+
+	/* Configure button for wake from System OFF.
+	 * Per Zephyr example: GPIO_INPUT only, GPIO_INT_LEVEL_ACTIVE.
+	 * Button is active-low: press pulls pin low, triggers wake. */
+	rc = gpio_pin_configure_dt(&btn, GPIO_INPUT);
+	if (rc < 0) {
+		printk("btn cfg fail %d\n", rc);
+		return;
+	}
+	rc = gpio_pin_interrupt_configure_dt(&btn, GPIO_INT_LEVEL_ACTIVE);
+	if (rc < 0) {
+		printk("btn int fail %d\n", rc);
+		return;
+	}
+
+	hwinfo_clear_reset_cause();
+	sys_poweroff();
+	/* Never reached -- wake = full reset via main(). */
+}
+
 /* =============================  Main  =================================== */
 
 int main(void)
 {
+	uint32_t reset_cause;
+
 	k_msleep(300);
 	printk("\n=== Audio Recorder (button + sleep) ===\n");
+
+	/* Check wake cause */
+	hwinfo_get_reset_cause(&reset_cause);
+	if (reset_cause & RESET_LOW_POWER_WAKE) {
+		printk("Wakeup from System OFF by GPIO\n");
+	} else if (reset_cause & RESET_PIN) {
+		printk("Reset by pin\n");
+	} else {
+		printk("Reset cause: 0x%08X\n", reset_cause);
+	}
 
 	/* Watchdog */
 	wdt_dev = DEVICE_DT_GET(DT_ALIAS(watchdog0));
@@ -625,8 +737,7 @@ int main(void)
 		return 0;
 	}
 
-	/* GPIO: LED ON, button with pull-up (active-low, also used for
-	 * System OFF wake: pin senses low level while sleeping). */
+	/* GPIO: LED ON, button with pull-up (active-low). */
 	gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
 	gpio_pin_configure_dt(&btn, GPIO_INPUT | GPIO_PULL_UP);
 	gpio_pin_interrupt_configure_dt(&btn, GPIO_INT_EDGE_TO_ACTIVE);
@@ -656,6 +767,13 @@ int main(void)
 
 	last_activity = k_uptime_get();
 
+#if defined(CONFIG_RAM_POWER_DOWN_LIBRARY)
+	/* Power down RAM blocks the application image does not use. Lowers
+	 * System-ON idle current (each unused 32 KiB block ~0.3-0.5 uA). Safe
+	 * here because the heap is a fixed k_heap, not the libc heap. */
+	power_down_unused_ram();
+#endif
+
 	while (1) {
 		if (btn_pressed) {
 			static int64_t last_btn;
@@ -676,22 +794,7 @@ int main(void)
 		/* Idle timeout -> system OFF. Wake on button GPIO. */
 		if (!recording
 		    && (k_uptime_get() - last_activity) >= IDLE_SLEEP_MS) {
-			printk("Idle %ds -- entering system OFF\n",
-			       (int)(IDLE_SLEEP_MS / 1000));
-			sd_teardown();
-			gpio_pin_set_dt(&led, 0);  /* LED off */
-			k_msleep(100);
-
-			/* Configure GPIO SENSE on the button pin so the chip wakes
-			 * when the button is pressed (pin goes low). Without this,
-			 * only the RESET pin can wake the chip from System OFF. */
-			nrf_gpio_cfg_sense_input(
-				NRF_DT_GPIOS_TO_PSEL(DT_ALIAS(sw0), gpios),
-				NRF_GPIO_PIN_PULLUP,
-				NRF_GPIO_PIN_SENSE_LOW);
-
-			sys_poweroff();
-			/* Never reached -- wake = full reset via main(). */
+			enter_system_off();
 		}
 
 		/* Watchdog: feed only if SD writer is making progress. */

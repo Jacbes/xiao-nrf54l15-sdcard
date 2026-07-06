@@ -44,6 +44,19 @@
 	status = "disabled";
 };
 
+/* Disable peripherals the audio recorder never uses. Each one that stays
+ * enabled keeps a clock/power domain alive and pulls in driver code/flash.
+ * - i2c30 + on-board IMU (lsm6ds3tr): no motion sensing in this app.
+ * - spi00: we use SPIM22 for the SD card.
+ * - uart21: console is on uart20; the second UART is unused.
+ * - temp: internal temp sensor, unused.
+ * - nfct: NFC antenna front-end, unused (its pins can leak if left on). */
+&i2c30 { status = "disabled"; };
+&spi00  { status = "disabled"; };
+&uart21 { status = "disabled"; };
+&temp   { status = "disabled"; };
+&nfct   { status = "disabled"; };
+
 &spi22 {
 	compatible = "nordic,nrf-spim";
 	pinctrl-0 = <&spi22_sd_default>;

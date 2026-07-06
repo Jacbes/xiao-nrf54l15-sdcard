@@ -46,6 +46,20 @@ ffmpeg -f s16le -ar 16000 -ac 1 -i rec_XXXX.raw rec_XXXX.wav
 - Wake from sleep: press the user button (P0.00)
 - On wake, device performs a full reset and returns to idle state
 
+### Low-Power / System OFF
+
+Before entering System OFF the firmware shuts down everything that would otherwise keep drawing current (per nRF54L15 best practice — the SoC itself already disables RAM retention inside `sys_poweroff()`):
+
+- **Stop the PDM capture** (`dmic_disarm`) and unmount/deinit the SD stack (`sd_teardown`) so the EasyDMA-style peripherals release their power domains.
+- **Deassert the on-board regulator-enable GPIOs** (`pdm_imu_pwr`, `vbat_pwr`, `rfsw_pwr`, `rfsw_ctl`). These are `regulator-boot-on` on the XIAO nRF54L15 and stay latched active through sleep — they power the external mic, the VBat divider and the RF front-end switch, and are the dominant sleep-current contributors.
+- **Suspend the UART console** (`pm_device_action_run(..., SUSPEND)`). If this fails the device aborts System OFF and stays awake (matching the Zephyr `system_off` sample).
+- **Disable the watchdog** and turn the LED off explicitly.
+- **Power down unused RAM blocks** (`CONFIG_RAM_POWER_DOWN_LIBRARY` + `power_down_unused_ram()`) for the System-ON idle window.
+
+In the device-tree overlay, peripherals the recorder never uses are turned off so they neither keep a clock domain alive nor pull in driver code: `i2c30` (+ on-board IMU), `spi00`, `uart21`, `temp`, `nfct`. The main DCDC regulator is enabled by the board (`vregmain` → DCDC mode) and the LF clock uses the LFXO.
+
+> Note: the absolute System OFF current on the XIAO module also depends on on-board circuitry (LDO, pull-ups). Measure with the debug probe **disconnected** and RTT disabled for a true figure. The firmware-side optimizations above remove the largest software-controllable contributors.
+
 ### Fault Tolerance
 
 Three threads decouple audio capture from SD card writes:
@@ -92,7 +106,7 @@ west build -b xiao_nrf54l15/nrf54l15/cpuapp -p always
 west flash -r openocd
 ```
 
-Logs output to serial terminal (COM6, 115200 baud).
+Logs output to serial terminal (COM6, 115200 baud). Footprint: **FLASH 5.8%** (85 KB), **RAM 74%** (143 KB of 188 KB).
 
 ### Battery / Production (RTT only)
 
@@ -101,7 +115,9 @@ west build -b xiao_nrf54l15/nrf54l15/cpuapp -p always -- -DOVERLAY_CONFIG="prj_b
 west flash -r openocd
 ```
 
-UART is fully disabled. Logs via Segger RTT only (requires J-Link or CMSIS-DAP with RTT support). This configuration is **required** for boot from 3.7V LiPo battery on hardware revision v1.0 (known Seeed limitation: enabled UART prevents battery-only boot).
+UART is fully disabled. Logs via Segger RTT only (requires J-Link or CMSIS-DAP with RTT support). This configuration is **required** for boot from 3.7V LiPo battery on hardware revision v1.0 (known Seeed limitation: enabled UART prevents battery-only boot). Footprint: **FLASH 4.8%** (70 KB), **RAM 74%** (142 KB).
+
+> Both targets build cleanly with NCS v3.3.0 / Zephyr 4.3. The battery target has no UART device compiled in, so the System OFF path guards all console access behind `CONFIG_UART_CONSOLE`.
 
 ## File Structure
 
