@@ -30,11 +30,16 @@
 #include <zephyr/sys/poweroff.h>
 #include <zephyr/sys/util.h>
 #include <ff.h>
+#include <opus.h>
+#include "ble_audio.h"
 #include <string.h>
 #include <stdio.h>
 #if defined(CONFIG_RAM_POWER_DOWN_LIBRARY)
 #include <ram_pwrdn.h>
 #endif
+
+/* Set to 1 for Opus evaluation: auto-record 30 s on boot. */
+#define TEST_OPUS 0
 
 /* =============================  Constants  ============================== */
 
@@ -55,19 +60,20 @@ K_MEM_SLAB_DEFINE_STATIC(mem_slab, BLOCK_SIZE, BLOCK_COUNT, 4);
 /* Software gain (PDM has no HW PGA). 32 ~ +30 dB with soft-knee limiter. */
 #define SW_GAIN          32
 
-/* Ring buffer: 2 s of latency absorption between DMIC and SD writer. */
-#define RING_BUF_SIZE    65536
+/* Ring buffer: 0.5 s of latency absorption between DMIC and SD writer. */
+#define RING_BUF_SIZE    16384
 RING_BUF_DECLARE(audio_ring_buf, RING_BUF_SIZE);
 
-/* Write buffer: flush 0.5 s of audio per fs_write (16 KiB).
- * Large enough for efficient SD block writes, but half the size of a
- * 1 s buffer -- frees ~16 KiB of RAM (drops RAM use from ~82% to ~73%). */
-#define WRITE_BUF_SIZE   (AUDIO_BPS / 2)
+/* Write buffer: flush 0.5 s of audio per fs_write (8 KiB). */
+#define WRITE_BUF_SIZE   (AUDIO_BPS / 4)
 
 /* Timing */
 #define SYNC_MS          8000    /* FAT commit interval */
 #define IDLE_SLEEP_MS    10000   /* 10 s idle -> system OFF */
 #define BTN_DEBOUNCE_MS  300
+#define BTN_SHORT_MS     2000    /* click held < 2 s  -> record toggle */
+#define BTN_LONG_MS      5000    /* hold  >= 5 s      -> pairing mode */
+#define BATT_UPDATE_MS   5000    /* BLE battery refresh interval */
 
 /* Watchdog: reboot if SD stack hangs. */
 #define WDT_TIMEOUT_MS   60000
@@ -96,47 +102,151 @@ static bool sd_mounted;
 static struct fs_file_t rec_file;
 static char rec_path[64];
 
-static int64_t rec_start, last_sync, last_activity;
+static int64_t rec_start, last_sync, last_activity, last_batt;
 static uint32_t written, dropped, sd_writes, rec_errs;
 
 K_THREAD_STACK_DEFINE(led_stk, 512);
 static struct k_thread led_th;
 K_THREAD_STACK_DEFINE(dmic_stk, 2048);
 static struct k_thread dmic_th;
-K_THREAD_STACK_DEFINE(sd_stk, 12288);
+K_THREAD_STACK_DEFINE(sd_stk, 24576);
 static struct k_thread sd_th;
 K_SEM_DEFINE(data_sem, 0, 1);
 
-/* Battery monitoring via ADC (channel 7, on-board divider). */
-#define VBATT_ADC_CH     7
-static bool adc_ch_ready;
+/* Opus encoder */
+#define OPUS_FRAME_MS      20
+#define OPUS_FRAME_SAMPLES (SAMPLE_RATE * OPUS_FRAME_MS / 1000)  /* 320 */
+#define OPUS_FRAME_BYTES   (OPUS_FRAME_SAMPLES * BYTES_PER_SAMPLE)  /* 640 */
+#define OPUS_BITRATE       24000
+#define OPUS_MAX_PKT       4000
+
+/* Encoder state buffer (static, avoids malloc).  opus_encoder_get_size(1)
+ * is ~22 KiB for fixed-point 16 kHz mono -- 28 KiB gives headroom. */
+static uint8_t  opus_enc_mem[24576] __aligned(4);
+static OpusEncoder *opus_enc;
+static uint8_t  opus_pcm_acc[OPUS_FRAME_BYTES];
+static uint32_t opus_pcm_pos;
+static uint8_t  opus_pkt[OPUS_MAX_PKT];
+static uint32_t raw_pcm_bytes;   /* raw bytes that would have been written */
+static uint32_t enc_bytes;        /* actual encoded bytes written */
+
+/* BLE packet queue: SD thread enqueues opus packets, a dedicated BLE
+ * thread dequeues and sends notifications. This keeps BLE stack usage
+ * out of the SD thread's stack (which must host opus VLAs). */
+struct ble_pkt {
+	uint16_t len;
+	uint8_t  data[80];  /* 24 kbps / 20 ms -> ~60 bytes max */
+};
+K_MSGQ_DEFINE(ble_pkt_q, sizeof(struct ble_pkt), 4, 4);
+K_THREAD_STACK_DEFINE(ble_stk, 2048);
+static struct k_thread ble_th;
+
+static bool opus_enc_init(void)
+{
+	opus_enc = (OpusEncoder *)opus_enc_mem;
+	int rc = opus_encoder_init(opus_enc, SAMPLE_RATE, 1,
+				  OPUS_APPLICATION_VOIP);
+	if (rc != OPUS_OK) {
+		printk("opus init fail %d\n", rc);
+		return false;
+	}
+	opus_encoder_ctl(opus_enc, OPUS_SET_BITRATE(OPUS_BITRATE));
+	opus_encoder_ctl(opus_enc, OPUS_SET_COMPLEXITY(3));
+	opus_encoder_ctl(opus_enc, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
+	opus_encoder_ctl(opus_enc, OPUS_SET_DTX(1));
+	opus_pcm_pos = 0;
+	raw_pcm_bytes = 0;
+	enc_bytes = 0;
+	printk("Opus enc ready: %d Hz, mono, %d bps, %d ms frames\n",
+	       SAMPLE_RATE, OPUS_BITRATE, OPUS_FRAME_MS);
+	return true;
+}
+
+/* Encode one chunk of raw PCM through the opus encoder.
+ * Writes length-prefixed packets to the open rec_file. */
+static void opus_encode_chunk(const uint8_t *pcm, uint32_t len)
+{
+	uint32_t pos = 0;
+	while (pos < len && recording) {
+		uint32_t need = OPUS_FRAME_BYTES - opus_pcm_pos;
+		uint32_t avail = len - pos;
+		uint32_t chunk = (avail < need) ? avail : need;
+		memcpy(&opus_pcm_acc[opus_pcm_pos], &pcm[pos], chunk);
+		opus_pcm_pos += chunk;
+		pos += chunk;
+
+		if (opus_pcm_pos >= OPUS_FRAME_BYTES) {
+			int n = opus_encode(opus_enc,
+				(const opus_int16 *)opus_pcm_acc,
+				OPUS_FRAME_SAMPLES,
+				opus_pkt, OPUS_MAX_PKT);
+			if (n > 0 && file_open) {
+				uint8_t hdr[2] = { n & 0xFF, (n >> 8) & 0xFF };
+				fs_write(&rec_file, hdr, 2);
+				fs_write(&rec_file, opus_pkt, n);
+				enc_bytes += n + 2;
+				/* Send via BLE queue (separate thread). */
+				if (ble_audio_is_connected() && n <= 80) {
+					struct ble_pkt pkt;
+					pkt.len = n;
+					memcpy(pkt.data, opus_pkt, n);
+					k_msgq_put(&ble_pkt_q, &pkt, K_NO_WAIT);
+				}
+			} else if (n < 0) {
+				printk("opus_encode err %d\n", n);
+			}
+			raw_pcm_bytes += OPUS_FRAME_BYTES;
+			opus_pcm_pos = 0;
+		}
+	}
+}
+
+/* Battery monitoring via ADC (channel 7, on-board 1:2 divider).
+ * The DTS io-channels node (zephyr,user) references channel 7 with the
+ * board's gain (1/4) and reference (internal, 0.9 V on nRF54L15). */
+#define BATT_DIVIDER   2  /* external divider ratio (cell = pin × N) */
+
+#if !DT_NODE_EXISTS(DT_PATH(zephyr_user)) || \
+    !DT_NODE_HAS_PROP(DT_PATH(zephyr_user), io_channels)
+#error "zephyr,user / io-channels missing in overlay"
+#endif
+
+static const struct adc_dt_spec batt_adc =
+	ADC_DT_SPEC_GET_BY_IDX(DT_PATH(zephyr_user), 0);
+
+static bool adc_ready;
 
 static int read_battery_mv(void)
 {
-	const struct device *d = DEVICE_DT_GET(DT_NODELABEL(adc));
-	if (!device_is_ready(d)) return -1;
-	if (!adc_ch_ready) {
-		struct adc_channel_cfg cc = {
-			.gain = ADC_GAIN_1_4,
-			.reference = ADC_REF_INTERNAL,
-			.acquisition_time = ADC_ACQ_TIME_DEFAULT,
-			.channel_id = VBATT_ADC_CH,
-#if defined(CONFIG_ADC_NRFX_SAADC)
-			.input_positive = 7,
-#endif
-		};
-		if (adc_channel_setup(d, &cc) != 0) return -1;
-		adc_ch_ready = true;
+	int16_t raw;
+	int32_t mv;
+	int err;
+
+	if (!adc_ready) {
+		if (!device_is_ready(batt_adc.dev)) return -1;
+		if (adc_channel_setup_dt(&batt_adc) != 0) return -1;
+		adc_ready = true;
 	}
-	int16_t sb = 0;
-	struct adc_sequence as = {
-		.channels = BIT(VBATT_ADC_CH),
-		.buffer = &sb,
-		.buffer_size = sizeof(sb),
-		.resolution = 12,
-	};
-	if (adc_read(d, &as)) return -1;
-	return (int)(((int32_t)sb * 2400) / 4096);
+
+	struct adc_sequence seq = {0};
+	adc_sequence_init_dt(&batt_adc, &seq);
+	seq.buffer = &raw;
+	seq.buffer_size = sizeof(raw);
+
+	/* Read twice; first is sometimes stale after regulator power-on. */
+	err = adc_read(batt_adc.dev, &seq);
+	if (err) return -1;
+	err = adc_read(batt_adc.dev, &seq);
+	if (err) return -1;
+
+	mv = (int32_t)raw;
+	err = adc_raw_to_millivolts_dt(&batt_adc, &mv);
+	if (err < 0) return -1;
+
+	/* Pin-voltage to LiPo cell voltage: compensate the external divider. */
+	mv *= BATT_DIVIDER;
+
+	return (int)mv;
 }
 
 /* Watchdog */
@@ -317,6 +427,21 @@ static void btn_isr(const struct device *d, struct gpio_callback *c, uint32_t p)
 	btn_pressed = true;
 }
 
+/* BLE sender thread: drains opus packet queue and sends GATT
+ * notifications.  Own stack (2 KiB) so SD thread stack is not
+ * consumed by the BLE SoftDevice call chain. */
+static void ble_fn(void *a, void *b, void *c)
+{
+	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
+	struct ble_pkt pkt;
+
+	while (1) {
+		if (k_msgq_get(&ble_pkt_q, &pkt, K_MSEC(100)) == 0) {
+			ble_audio_send(pkt.data, pkt.len);
+		}
+	}
+}
+
 /* DMIC capture: PDM -> gain -> ring buffer. Never blocks on SD. */
 static void dmic_fn(void *a, void *b, void *c)
 {
@@ -445,14 +570,12 @@ static bool recover_and_flush(uint8_t *wbuf, uint32_t *pos)
 	return false;
 }
 
-/* SD writer thread: drain ring -> write buf -> SD card. */
+/* SD writer thread: drain ring -> opus encode -> SD card. */
 static void sd_fn(void *a, void *b, void *c)
 {
 	ARG_UNUSED(a); ARG_UNUSED(b); ARG_UNUSED(c);
-	static uint8_t wbuf[WRITE_BUF_SIZE];
-	uint32_t pos = 0;
 	int64_t last_hb;
-	int64_t sync_incident_start;
+	uint8_t tmp[OPUS_FRAME_BYTES * 2];
 
 	while (1) {
 		while (!recording) {
@@ -460,70 +583,24 @@ static void sd_fn(void *a, void *b, void *c)
 		}
 		last_sync = k_uptime_get();
 		last_hb = last_sync;
-		sync_incident_start = 0;
 		sd_alive();
-		pos = 0;
 
 		while (recording) {
 			sd_alive();
 			k_sem_take(&data_sem, K_MSEC(100));
 
-			/* Drain ring into write buffer. */
-			while (ring_buf_size_get(&audio_ring_buf) > 0
-			       && pos < WRITE_BUF_SIZE) {
+			/* Drain ring -> opus encode -> SD. */
+			while (ring_buf_size_get(&audio_ring_buf) > 0 && recording) {
 				uint32_t rd = ring_buf_get(&audio_ring_buf,
-							   &wbuf[pos],
-							   WRITE_BUF_SIZE - pos);
+							  tmp, sizeof(tmp));
 				if (rd == 0) break;
-				pos += rd;
+				opus_encode_chunk(tmp, rd);
 			}
-
-			/* Flush when buffer full (1 s audio). */
-			if (pos >= WRITE_BUF_SIZE) {
-				int wrc = flush_write_buf(wbuf, &pos);
-				if (wrc < 0) {
-					rec_errs++;
-					if (wrc == -2) { recording = false; break; }
-					if (!recover_and_flush(wbuf, &pos)) {
-						recording = false;
-						break;
-					}
-				}
-			}
-			if (!recording) break;
 
 			/* Periodic FAT sync. */
 			int64_t now = k_uptime_get();
-			if (now - last_sync >= SYNC_MS) {
-				if (pos > 0) {
-					int wrc = flush_write_buf(wbuf, &pos);
-					if (wrc < 0) {
-						rec_errs++;
-						if (wrc == -2) { recording = false; break; }
-						if (!recover_and_flush(wbuf, &pos)) {
-							recording = false;
-							break;
-						}
-					}
-				}
-				if (file_open && fs_sync(&rec_file) != 0) {
-					rec_errs++;
-					if (sync_incident_start == 0) {
-						sync_incident_start = k_uptime_get();
-					}
-					if (!recover_file_loop(sync_incident_start)) {
-						recording = false;
-						break;
-					}
-					if (k_uptime_get() - sync_incident_start
-					    > RECOVERY_TIMEOUT_MS) {
-						printk("  sync timeout -- giving up\n");
-						recording = false;
-						break;
-					}
-				} else if (file_open) {
-					sync_incident_start = 0;
-				}
+			if (now - last_sync >= SYNC_MS && file_open) {
+				fs_sync(&rec_file);
 				last_sync = now;
 			}
 
@@ -531,21 +608,24 @@ static void sd_fn(void *a, void *b, void *c)
 			if (recording && now - last_hb >= 5000) {
 				int32_t el = (int32_t)((now - rec_start) / 1000);
 				int vb = read_battery_mv();
-				printk("  %02d:%02d  %uKB  drop %uKB  errs %u  "
-				       "ring %u  vbat %dmV\n",
+				unsigned raw_kb = raw_pcm_bytes / 1024;
+				unsigned enc_kb = enc_bytes / 1024;
+				unsigned ratio = raw_kb ? (raw_kb * 100 / enc_kb) : 0;
+				printk("  %02d:%02d  raw %uKB  enc %uKB  "
+				       "ratio %u.%02u  drop %uKB  ring %u  "
+				       "vbat %dmV\n",
 				       (int)(el / 60), (int)(el % 60),
-				       (unsigned)(written / 1024),
+				       raw_kb, enc_kb,
+				       (unsigned)(ratio / 100),
+				       (unsigned)(ratio % 100),
 				       (unsigned)(dropped / 1024),
-				       (unsigned)rec_errs,
-				       ring_buf_size_get(&audio_ring_buf), vb);
+				       ring_buf_size_get(&audio_ring_buf),
+				       vb);
 				last_hb = now;
 			}
 		}
 
-		/* Final flush. */
-		if (pos > 0 && file_open) {
-			flush_write_buf(wbuf, &pos);
-		}
+		/* Final sync. */
 		if (file_open) {
 			fs_sync(&rec_file);
 		}
@@ -566,11 +646,16 @@ static void start_rec(void)
 		printk("no free index\n");
 		return;
 	}
-	snprintf(rec_path, sizeof(rec_path), DISK_MOUNT_PT "/rec_%04d.raw", idx);
+	snprintf(rec_path, sizeof(rec_path), DISK_MOUNT_PT "/rec_%04d.opus", idx);
 	ring_buf_reset(&audio_ring_buf);
 	written = dropped = sd_writes = rec_errs = 0;
 	if (!open_append()) {
 		printk("open fail\n");
+		return;
+	}
+	if (!opus_enc_init()) {
+		fs_close(&rec_file);
+		file_open = false;
 		return;
 	}
 	if (!dmic_arm()) {
@@ -583,6 +668,7 @@ static void start_rec(void)
 	sd_last_alive = rec_start;
 	last_activity = rec_start;
 	recording = true;
+	ble_audio_set_recording(true);
 	printk("REC -> %s\n", rec_path);
 }
 
@@ -591,6 +677,7 @@ static void stop_rec(void)
 	if (!recording) return;
 	int64_t elapsed_ms = k_uptime_get() - rec_start;
 	recording = false;
+	ble_audio_set_recording(false);
 	k_msleep(400);
 	dmic_disarm();
 	k_msleep(200);
@@ -599,12 +686,14 @@ static void stop_rec(void)
 		fs_close(&rec_file);
 		file_open = false;
 	}
+	opus_pcm_pos = 0;
 	int32_t s = (int32_t)(elapsed_ms / 1000);
-	printk("STOP %02d:%02d  %uKB  drop %uKB  errs %u\n",
+	printk("STOP %02d:%02d  raw %uKB  enc %uKB  x%u  drop %uKB\n",
 	       s / 60, s % 60,
-	       (unsigned)(written / 1024),
-	       (unsigned)(dropped / 1024),
-	       (unsigned)rec_errs);
+	       (unsigned)(raw_pcm_bytes / 1024),
+	       (unsigned)(enc_bytes / 1024),
+	       (unsigned)(raw_pcm_bytes / (enc_bytes ? enc_bytes : 1)),
+	       (unsigned)(dropped / 1024));
 	last_activity = k_uptime_get();
 }
 
@@ -751,6 +840,8 @@ int main(void)
 			dmic_fn, 0, 0, 0, K_PRIO_PREEMPT(1), 0, K_NO_WAIT);
 	k_thread_create(&sd_th, sd_stk, K_THREAD_STACK_SIZEOF(sd_stk),
 			sd_fn, 0, 0, 0, K_PRIO_PREEMPT(3), 0, K_NO_WAIT);
+	k_thread_create(&ble_th, ble_stk, K_THREAD_STACK_SIZEOF(ble_stk),
+			ble_fn, 0, 0, 0, K_PRIO_PREEMPT(5), 0, K_NO_WAIT);
 
 	/* Mount SD */
 	while (!sd_mounted) {
@@ -762,10 +853,14 @@ int main(void)
 	printk("SD mounted\n");
 	int vbat = read_battery_mv();
 	printk("VBat: %d mV\n", vbat);
-	printk("Ready. Press button to record. Sleep after %d s idle.\n",
+	printk("Ready. Short click <%ds = record, hold >%ds = pair.\n"
+	       "Sleeps after %d s idle.\n",
+	       (int)(BTN_SHORT_MS / 1000),
+	       (int)(BTN_LONG_MS / 1000),
 	       (int)(IDLE_SLEEP_MS / 1000));
 
 	last_activity = k_uptime_get();
+	last_batt = last_activity;
 
 #if defined(CONFIG_RAM_POWER_DOWN_LIBRARY)
 	/* Power down RAM blocks the application image does not use. Lowers
@@ -774,26 +869,87 @@ int main(void)
 	power_down_unused_ram();
 #endif
 
+#if TEST_OPUS
+	/* Auto-test: record 30 seconds, then stop. */
+	printk("[TEST] auto-start recording 30s...\n");
+	start_rec();
+	if (recording) {
+		k_msleep(30000);
+		stop_rec();
+		printk("[TEST] done.\n");
+	}
+#endif
+
+	/* BLE init + normal advertising (reconnect to bonded device).
+	 * Button short/long press is handled in the main loop. */
+	if (ble_audio_init() == 0) {
+		/* Publish the boot battery reading so the phone shows it as
+		 * soon as it connects / subscribes. */
+		ble_audio_set_battery_mv(read_battery_mv());
+		ble_audio_start_advertising(false);
+	}
+
+	/* If the wake button is still held, feed it into the main-loop
+	 * handler so the user can short-tap to record or long-hold to pair. */
+	if (!gpio_pin_get_dt(&btn)) {
+		btn_pressed = true;
+	}
+
 	while (1) {
+		/* Periodic battery refresh over BLE. */
+		if (ble_audio_has_conn() &&
+		    (k_uptime_get() - last_batt) >= BATT_UPDATE_MS) {
+			last_batt = k_uptime_get();
+			ble_audio_set_battery_mv(read_battery_mv());
+		}
+
 		if (btn_pressed) {
 			static int64_t last_btn;
 			if (k_uptime_get() - last_btn >= BTN_DEBOUNCE_MS) {
 				last_btn = k_uptime_get();
 				btn_pressed = false;
 				last_activity = last_btn;
-				if (recording) {
+
+				/* Boot/idle button window:
+				 *   click held < 2 s  -> toggle recording
+				 *   hold  >= 5 s      -> clear bonds & re-pair
+				 *   2..5 s            -> ignored (ambiguous)
+				 * Poll the button while it is held, up to BTN_LONG_MS. */
+				int64_t press_start = k_uptime_get();
+				while (!gpio_pin_get_dt(&btn) &&
+				       (k_uptime_get() - press_start) < BTN_LONG_MS) {
+					k_msleep(50);
+				}
+				int64_t held_ms = k_uptime_get() - press_start;
+
+				if (held_ms >= BTN_LONG_MS) {
+					/* Long hold -> pairing mode. */
+					printk("Long press %lldms -> pairing\n", held_ms);
 					stop_rec();
+					ble_audio_clear_bonds();
+					ble_audio_start_advertising(true);
+				} else if (held_ms < BTN_SHORT_MS) {
+					/* Short click -> toggle recording. */
+					if (recording) {
+						stop_rec();
+					} else {
+						start_rec();
+					}
 				} else {
-					start_rec();
+					printk("Press %lldms ignored (need <%ds or >%ds)\n",
+					       held_ms,
+					       (int)(BTN_SHORT_MS / 1000),
+					       (int)(BTN_LONG_MS / 1000));
 				}
 			} else {
 				btn_pressed = false;
 			}
 		}
 
-		/* Idle timeout -> system OFF. Wake on button GPIO. */
-		if (!recording
-		    && (k_uptime_get() - last_activity) >= IDLE_SLEEP_MS) {
+		/* Idle timeout -> system OFF. Skip while recording or while a
+		 * phone is connected over BLE. Wake on button GPIO. */
+		if (!recording && !ble_audio_has_conn() &&
+		    (k_uptime_get() - last_activity) >= IDLE_SLEEP_MS) {
 			enter_system_off();
 		}
 

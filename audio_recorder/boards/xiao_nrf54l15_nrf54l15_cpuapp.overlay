@@ -103,4 +103,12 @@
 	aliases {
 		sdhc0 = &sdhc0;
 	};
+
+	/* Battery voltage measurement: AIN7 is fed by the on-board VBAT
+	 * divider (enabled by the vbat_pwr regulator). Read via the
+	 * zephyr,user io-channel so the SAADC gain/reference (1/4 gain,
+	 * 0.9 V internal ref on nRF54L15) is handled by the ADC framework. */
+	zephyr,user {
+		io-channels = <&adc 7>;
+	};
 };
